@@ -45,6 +45,10 @@ setup(
             'train_agent = turtlebot3_drl.drl_agent.drl_agent:main_train',
             'test_agent = turtlebot3_drl.drl_agent.drl_agent:main_test',
             'real_agent = turtlebot3_drl.drl_agent.drl_agent:main_real',
+            # Remote GPU inference nodes (use these instead of local training)
+            'remote_train_agent = turtlebot3_drl.drl_agent.drl_agent_remote:main_train',
+            'remote_test_agent = turtlebot3_drl.drl_agent.drl_agent_remote:main_test',
+            'remote_real_agent = turtlebot3_drl.drl_agent.drl_agent_remote:main_real',
         ],
     },
 )

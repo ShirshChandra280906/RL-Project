@@ -20,7 +20,7 @@ import math
 import numpy
 import sys
 import copy
-from numpy.core.numeric import Infinity
+from numpy import inf as Infinity
 
 from geometry_msgs.msg import Pose, Twist
 from rosgraph_msgs.msg import Clock
