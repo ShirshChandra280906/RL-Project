@@ -26,10 +26,14 @@ import torch.nn.functional as F
 
 from .networks import SubgoalActorNetwork, SubgoalCriticNetwork
 
-# Import config
-import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from hierarchical.config import HierarchicalConfig
+# Import config - handle both standalone and installed package
+try:
+    from ..config import HierarchicalConfig
+except ImportError:
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from hierarchical.config import HierarchicalConfig
 
 
 class OUNoise:
@@ -195,6 +199,7 @@ class SubgoalAgent:
         # Counters
         self.prediction_count = 0
         self.replan_interval = config.ASTAR_REPLAN_INTERVAL
+        self.total_steps = 0
         
         # Training flag
         self.training = True
@@ -381,6 +386,10 @@ class SubgoalAgent:
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
         self.prediction_count = checkpoint.get('prediction_count', 0)
+    
+    def train_step(self) -> Dict[str, float]:
+        """Alias for update() for compatibility with trainer."""
+        return self.update()
     
     def subgoal_to_cartesian(
         self,

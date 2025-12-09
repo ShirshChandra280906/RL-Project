@@ -3,4 +3,18 @@
 
 from .config import HierarchicalConfig
 
-__all__ = ['HierarchicalConfig']
+# Import submodules for easy access
+from . import planners
+from . import preprocessing
+from . import agents
+from . import environments
+from . import training
+
+__all__ = [
+    'HierarchicalConfig',
+    'planners',
+    'preprocessing', 
+    'agents',
+    'environments',
+    'training'
+]

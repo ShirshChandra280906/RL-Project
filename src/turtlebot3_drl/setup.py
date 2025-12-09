@@ -49,6 +49,8 @@ setup(
             'remote_train_agent = turtlebot3_drl.drl_agent.drl_agent_remote:main_train',
             'remote_test_agent = turtlebot3_drl.drl_agent.drl_agent_remote:main_test',
             'remote_real_agent = turtlebot3_drl.drl_agent.drl_agent_remote:main_real',
+            # Hierarchical navigation training
+            'hierarchical_train = turtlebot3_drl.hierarchical.training.hierarchical_trainer:main',
         ],
     },
 )

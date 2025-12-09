@@ -263,6 +263,26 @@ class WaypointManager:
         for x, y in waypoints:
             flat.extend([x, y])
         return np.array(flat, dtype=np.float32)
+
+    def get_waypoints_robot_frame(
+        self,
+        robot_x: float,
+        robot_y: float,
+        robot_theta: float
+    ) -> np.ndarray:
+        """
+        Convenience wrapper returning waypoints in robot frame as an array.
+
+        Args:
+            robot_x: Robot x position in world frame
+            robot_y: Robot y position in world frame
+            robot_theta: Robot heading in world frame (radians)
+
+        Returns:
+            Array of shape (num_waypoints, 2) in robot-centric coordinates.
+        """
+        waypoints = self.get_waypoints((robot_x, robot_y, robot_theta))
+        return np.array(waypoints, dtype=np.float32)
     
     def get_distance_to_goal(self, robot_x: float, robot_y: float) -> float:
         """

@@ -1,19 +1,24 @@
-# Environments module
-# Contains hierarchical environment, scenes, and obstacle management
+"""
+Environments package for Hierarchical Navigation.
+
+Provides simulation environments for training and testing.
+"""
 
 from .scenes import (
     SceneType,
+    SceneInfo,
     BaseScene,
+    EmptyScene,
     CorridorScene,
-    IntersectionScene,
-    OfficeScene,
+    RoomScene,
+    SimpleMazeScene,
+    RandomObstacleScene,
     SceneFactory
 )
 
 from .obstacles import (
     ObstacleType,
     Obstacle,
-    DynamicObstacleMode,
     ObstacleManager
 )
 
@@ -25,21 +30,22 @@ from .hierarchical_env import (
     MAPretrainingEnvironment
 )
 
-
 __all__ = [
     # Scenes
     'SceneType',
+    'SceneInfo',
     'BaseScene',
+    'EmptyScene',
     'CorridorScene',
-    'IntersectionScene',
-    'OfficeScene',
+    'RoomScene',
+    'SimpleMazeScene',
+    'RandomObstacleScene',
     'SceneFactory',
     # Obstacles
     'ObstacleType',
     'Obstacle',
-    'DynamicObstacleMode',
     'ObstacleManager',
-    # Environment
+    # Environments
     'TerminationReason',
     'RobotState',
     'HierarchicalStep',

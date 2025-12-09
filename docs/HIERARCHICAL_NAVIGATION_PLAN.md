@@ -1,3 +1,9 @@
+<!-- 
+cd /mnt/c/Users/Parv/OneDrive/Desktop/turtlebot3_drlnav && colcon build --packages-select turtlebot3_drl 
+cd /mnt/c/Users/Parv/OneDrive/Desktop/turtlebot3_drlnav && colcon build --packages-select turtlebot3_drl 2>&1
+
+ros2 run turtlebot3_drl hierarchical_train --stage sa --ma-model /mnt/c/Users/Parv/OneDrive/Desktop/turtlebot3_drlnav/install/turtlebot3_drl/lib/python3.10/site-packages/turtlebot3_drl/model/hierarchical/session_20251209_065009/ma/ma_converged.pth
+-->
 # Hierarchical DRL Navigation with Subgoal Agent
 
 ## Paper: Lightweight Motion Planning via Hierarchical Reinforcement Learning

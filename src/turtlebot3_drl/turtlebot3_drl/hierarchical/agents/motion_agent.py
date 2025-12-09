@@ -26,10 +26,14 @@ import torch.nn.functional as F
 
 from .networks import MotionActorNetwork, MotionCriticNetwork
 
-# Import config
-import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from hierarchical.config import HierarchicalConfig
+# Import config - handle both standalone and installed package
+try:
+    from ..config import HierarchicalConfig
+except ImportError:
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from hierarchical.config import HierarchicalConfig
 
 
 class GaussianNoise:
@@ -185,6 +189,7 @@ class MotionAgent:
         self.consecutive_successes = 0
         self.convergence_threshold = config.MA_CONVERGENCE_EPISODES
         self.converged = False
+        self.total_steps = 0
     
     def build_state(
         self,
@@ -373,6 +378,18 @@ class MotionAgent:
             self.actor.eval()
             self.critic.eval()
     
+    def freeze(self):
+        """Freeze all parameters (for use with SA training)."""
+        self.set_training(False)
+        for param in self.actor.parameters():
+            param.requires_grad = False
+        for param in self.critic.parameters():
+            param.requires_grad = False
+        for param in self.actor_target.parameters():
+            param.requires_grad = False
+        for param in self.critic_target.parameters():
+            param.requires_grad = False
+    
     def record_episode_result(self, success: bool):
         """
         Record episode result for convergence tracking.
@@ -418,6 +435,14 @@ class MotionAgent:
         self.update_count = checkpoint.get('update_count', 0)
         self.consecutive_successes = checkpoint.get('consecutive_successes', 0)
         self.converged = checkpoint.get('converged', False)
+    
+    def train_step(self) -> Dict[str, float]:
+        """Alias for update() for compatibility with trainer."""
+        return self.update()
+    
+    def has_converged(self) -> bool:
+        """Alias for is_converged() for compatibility."""
+        return self.is_converged()
 
 
 # =============================================================================

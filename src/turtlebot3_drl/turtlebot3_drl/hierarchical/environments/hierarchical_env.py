@@ -24,22 +24,29 @@ from typing import Tuple, List, Optional, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 
-# Import hierarchical components
-import sys
-import os
-# Add parent of hierarchical to path (turtlebot3_drl directory)
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-_hierarchical_dir = os.path.dirname(_current_dir)
-_turtlebot3_drl_dir = os.path.dirname(_hierarchical_dir)
-if _turtlebot3_drl_dir not in sys.path:
-    sys.path.insert(0, _turtlebot3_drl_dir)
-
-from hierarchical.config import HierarchicalConfig
-from hierarchical.environments.scenes import BaseScene, SceneFactory, SceneType
-from hierarchical.environments.obstacles import ObstacleManager, Obstacle
-from hierarchical.planners.astar import AStarPlanner
-from hierarchical.planners.waypoint_manager import WaypointManager
-from hierarchical.preprocessing.lidar_processor import LidarProcessor
+# Import hierarchical components - handle both standalone and installed package
+try:
+    from ..config import HierarchicalConfig
+    from .scenes import BaseScene, SceneFactory, SceneType
+    from .obstacles import ObstacleManager, Obstacle
+    from ..planners.astar import AStarPlanner
+    from ..planners.waypoint_manager import WaypointManager
+    from ..preprocessing.lidar_processor import LidarProcessor
+except ImportError:
+    import sys
+    import os
+    _current_dir = os.path.dirname(os.path.abspath(__file__))
+    _hierarchical_dir = os.path.dirname(_current_dir)
+    _turtlebot3_drl_dir = os.path.dirname(_hierarchical_dir)
+    if _turtlebot3_drl_dir not in sys.path:
+        sys.path.insert(0, _turtlebot3_drl_dir)
+    
+    from hierarchical.config import HierarchicalConfig
+    from hierarchical.environments.scenes import BaseScene, SceneFactory, SceneType
+    from hierarchical.environments.obstacles import ObstacleManager, Obstacle
+    from hierarchical.planners.astar import AStarPlanner
+    from hierarchical.planners.waypoint_manager import WaypointManager
+    from hierarchical.preprocessing.lidar_processor import LidarProcessor
 
 
 class TerminationReason(Enum):

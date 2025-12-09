@@ -1,21 +1,21 @@
-# Training module
-# Contains hierarchical trainer for two-stage training
+"""
+Training package for Hierarchical Navigation.
 
-from .trainer import (
-    TrainingStage,
-    TrainingMetrics,
-    TrainingConfig,
+Provides training utilities and the main training pipeline.
+"""
+
+from .hierarchical_trainer import (
+    TrainingLogger,
     MAPretrainer,
     SATrainer,
-    HierarchicalTrainer
+    HierarchicalTrainer,
+    main as train_main
 )
 
-
 __all__ = [
-    'TrainingStage',
-    'TrainingMetrics',
-    'TrainingConfig',
+    'TrainingLogger',
     'MAPretrainer',
     'SATrainer',
-    'HierarchicalTrainer'
+    'HierarchicalTrainer',
+    'train_main'
 ]
