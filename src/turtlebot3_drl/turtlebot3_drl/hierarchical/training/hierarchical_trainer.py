@@ -1,615 +1,448 @@
-"""
-Hierarchical DRL Training Pipeline
+"""Synchronous trainer/runner for the hierarchical TurtleBot3 DRL stack.
 
-Two-stage training process based on the paper:
-"Lightweight Motion Planning via Hierarchical Reinforcement Learning"
+This is a pragmatic, minimal implementation to let you:
+- Train: `ros2 run turtlebot3_drl train_hierarchical --episodes 10`
+- Run/infer: `ros2 run turtlebot3_drl run_hierarchical --episodes 1`
 
-Stage 1: Pre-train Motion Agent (MA) with sampled subgoals until convergence
-         (50 consecutive successes)
-Stage 2: Train Subgoal Agent (SA) with frozen MA
-
-Usage:
-    python hierarchical_trainer.py --stage 1  # Pre-train MA
-    python hierarchical_trainer.py --stage 2  # Train SA (after MA converged)
-    python hierarchical_trainer.py --stage full  # Both stages
+It wires SubgoalAgent (SA) + MotionAgent (MA) with the HierarchicalEnv.
+Uses hierarchical reward shaping from the paper:
+- SA Reward: collision penalty + path distance penalty + safety penalty + goal bonus
+- MA Reward: subgoal reach bonus + distance penalty
 """
 
-import os
-import sys
-import time
 import argparse
+import logging
 import math
-import json
+import os
+from pathlib import Path
+from typing import Dict, Tuple
+
 import numpy as np
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
-from collections import deque
+import rclpy
 
-# Handle imports for both standalone and installed package
-try:
-    from ..config import HierarchicalConfig
-    from ..agents.subgoal_agent import SubgoalAgent
-    from ..agents.motion_agent import MotionAgent
-    from ..environments.hierarchical_env import (
-        HierarchicalEnvironment,
-        MAPretrainingEnvironment,
-        TerminationReason
-    )
-    from ..environments.scenes import SceneType
-except ImportError:
-    # Add parent path for standalone execution
-    _current_dir = os.path.dirname(os.path.abspath(__file__))
-    _hierarchical_dir = os.path.dirname(_current_dir)
-    _turtlebot3_drl_dir = os.path.dirname(_hierarchical_dir)
-    if _turtlebot3_drl_dir not in sys.path:
-        sys.path.insert(0, _turtlebot3_drl_dir)
-    
-    from hierarchical.config import HierarchicalConfig
-    from hierarchical.agents.subgoal_agent import SubgoalAgent
-    from hierarchical.agents.motion_agent import MotionAgent
-    from hierarchical.environments.hierarchical_env import (
-        HierarchicalEnvironment,
-        MAPretrainingEnvironment,
-        TerminationReason
-    )
-    from hierarchical.environments.scenes import SceneType
-
-import torch
+from hierarchical.agents.motion_agent import MotionAgent
+from hierarchical.agents.subgoal_agent import SubgoalAgent
+from hierarchical.config import HierarchicalConfig
+from hierarchical.environments.hierarchical_env import HierarchicalEnv
 
 
-class TrainingLogger:
-    """Logs training metrics."""
-    
-    def __init__(self, log_dir: str, stage: str):
-        self.log_dir = log_dir
-        self.stage = stage
-        
-        os.makedirs(log_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_file = os.path.join(log_dir, f"{stage}_{timestamp}.json")
-        
-        self.metrics: Dict[str, List] = {
-            'episode': [],
-            'reward': [],
-            'steps': [],
-            'success': [],
-            'time': []
-        }
-        
-        self.start_time = time.time()
-    
-    def log(self, episode: int, reward: float, steps: int, success: bool, **kwargs):
-        """Log episode metrics."""
-        self.metrics['episode'].append(episode)
-        self.metrics['reward'].append(reward)
-        self.metrics['steps'].append(steps)
-        self.metrics['success'].append(success)
-        self.metrics['time'].append(time.time() - self.start_time)
-        
-        for key, value in kwargs.items():
-            if key not in self.metrics:
-                self.metrics[key] = []
-            self.metrics[key].append(value)
-    
-    def save(self):
-        """Save metrics to file."""
-        with open(self.log_file, 'w') as f:
-            json.dump(self.metrics, f, indent=2)
-    
-    def print_summary(self, window: int = 100):
-        """Print recent performance summary."""
-        if len(self.metrics['episode']) < window:
-            window = len(self.metrics['episode'])
-        
-        if window == 0:
-            return
-        
-        recent_rewards = self.metrics['reward'][-window:]
-        recent_success = self.metrics['success'][-window:]
-        
-        avg_reward = np.mean(recent_rewards)
-        success_rate = np.mean(recent_success) * 100
-        
-        print(f"  Last {window} episodes: avg_reward={avg_reward:.2f}, "
-              f"success_rate={success_rate:.1f}%")
+class HierarchicalRewardComputer:
+    """Computes hierarchical rewards for SA and MA based on the paper."""
 
-
-class MAPretrainer:
-    """
-    Pre-trains the Motion Agent with sampled subgoals.
-    
-    Training continues until MA achieves 50 consecutive successes.
-    """
-    
-    def __init__(
-        self,
-        config: HierarchicalConfig,
-        model_dir: str,
-        device: str = None
-    ):
+    def __init__(self, config: HierarchicalConfig):
         self.config = config
-        self.model_dir = model_dir
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        os.makedirs(model_dir, exist_ok=True)
-        
-        # Create MA and environment
-        self.ma = MotionAgent(config, device=self.device)
-        self.env = MAPretrainingEnvironment(config)
-        
-        # Logging
-        self.logger = TrainingLogger(
-            os.path.join(model_dir, 'logs'),
-            'ma_pretrain'
-        )
-        
-        # Convergence tracking
-        self.consecutive_successes = 0
-        self.convergence_threshold = config.MA_CONVERGENCE_EPISODES
-    
-    def train(self, max_episodes: int = 10000) -> bool:
-        """
-        Train MA until convergence.
-        
-        Args:
-            max_episodes: Maximum training episodes
-            
-        Returns:
-            True if converged, False if max_episodes reached
-        """
-        print(f"\n{'='*60}")
-        print("STAGE 1: Motion Agent Pre-training")
-        print(f"{'='*60}")
-        print(f"Device: {self.device}")
-        print(f"Convergence threshold: {self.convergence_threshold} consecutive successes")
-        print(f"Max episodes: {max_episodes}")
-        print()
-        
-        for episode in range(1, max_episodes + 1):
-            # Reset environment
-            state = self.env.reset()
-            episode_reward = 0
-            steps = 0
-            
-            done = False
-            while not done:
-                # Select action
-                if self.ma.total_steps < self.config.SA_BATCH_SIZE * 10:
-                    # Random exploration initially
-                    action = np.random.uniform(
-                        [self.config.MA_MIN_LINEAR_VEL, self.config.MA_MIN_ANGULAR_VEL],
-                        [self.config.MA_MAX_LINEAR_VEL, self.config.MA_MAX_ANGULAR_VEL]
-                    )
-                else:
-                    action = self.ma.select_action(state, add_noise=True)
-                
-                # Step environment
-                next_state, reward, done, info = self.env.step(action)
-                
-                # Store transition
-                self.ma.store_transition(state, action, reward, next_state, done)
-                
-                # Train
-                if self.ma.total_steps >= self.config.MA_BATCH_SIZE:
-                    self.ma.train_step()
-                
-                state = next_state
-                episode_reward += reward
-                steps += 1
-                self.ma.total_steps += 1
-            
-            # Track success
-            success = info.get('success', False)
-            
-            if success:
-                self.consecutive_successes += 1
-            else:
-                self.consecutive_successes = 0
-            
-            # Log
-            self.logger.log(
-                episode, episode_reward, steps, success,
-                consecutive_successes=self.consecutive_successes
-            )
-            
-            # Print progress
-            if episode % 100 == 0:
-                print(f"Episode {episode}/{max_episodes}")
-                self.logger.print_summary()
-                print(f"  Consecutive successes: {self.consecutive_successes}/{self.convergence_threshold}")
-            
-            # Check convergence
-            if self.consecutive_successes >= self.convergence_threshold:
-                print(f"\n✓ MA CONVERGED at episode {episode}!")
-                self._save_model('converged')
-                self.logger.save()
-                return True
-            
-            # Periodic save
-            if episode % 500 == 0:
-                self._save_model(f'ep{episode}')
-                self.logger.save()
-        
-        print(f"\n✗ MA did not converge within {max_episodes} episodes")
-        self._save_model('final')
-        self.logger.save()
-        return False
-    
-    def _save_model(self, suffix: str):
-        """Save MA model."""
-        path = os.path.join(self.model_dir, f'ma_{suffix}.pth')
-        self.ma.save(path)
-        print(f"Saved MA model to {path}")
+        self._prev_dist_goal = None
+        self._prev_dist_subgoal = None
 
+    def reset(self):
+        """Reset reward state for new episode."""
+        self._prev_dist_goal = None
+        self._prev_dist_subgoal = None
 
-class SATrainer:
-    """
-    Trains the Subgoal Agent with a frozen Motion Agent.
-    """
-    
-    def __init__(
+    def compute_sa_reward(
         self,
-        config: HierarchicalConfig,
-        model_dir: str,
-        ma_model_path: str,
-        device: str = None
-    ):
-        self.config = config
-        self.model_dir = model_dir
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        os.makedirs(model_dir, exist_ok=True)
-        
-        # Create SA
-        self.sa = SubgoalAgent(config, device=self.device)
-        
-        # Load pre-trained MA
-        self.ma = MotionAgent(config, device=self.device)
-        if os.path.exists(ma_model_path):
-            self.ma.load(ma_model_path)
-            print(f"Loaded MA from {ma_model_path}")
-        else:
-            print(f"WARNING: MA model not found at {ma_model_path}")
-        
-        # Freeze MA
-        self.ma.freeze()
-        
-        # Create environment
-        self.env = HierarchicalEnvironment(config)
-        
-        # Logging
-        self.logger = TrainingLogger(
-            os.path.join(model_dir, 'logs'),
-            'sa_train'
-        )
-    
-    def train(self, num_episodes: int = 5000):
+        dist_goal: float,
+        min_lidar: float,
+        collision: bool,
+        success: bool,
+        lidar_scan: np.ndarray,
+    ) -> Tuple[float, Dict[str, float]]:
         """
-        Train SA for specified episodes.
+        Compute Subgoal Agent reward based on hierarchical formulation.
         
-        Args:
-            num_episodes: Number of training episodes
+        SA Reward components:
+        - Collision penalty: SA_REWARD_COLLISION (-10.0)
+        - Goal bonus: SA_REWARD_GOAL (100.0)
+        - Path distance penalty: SA_REWARD_PATH_COEFF * dist_goal
+        - Safety penalty: SA_REWARD_SAFETY_COEFF * (num rays below safety threshold)
         """
-        print(f"\n{'='*60}")
-        print("STAGE 2: Subgoal Agent Training")
-        print(f"{'='*60}")
-        print(f"Device: {self.device}")
-        print(f"Episodes: {num_episodes}")
-        print(f"SA time step: {self.config.SA_TIME_STEP}s")
-        print(f"MA time step: {self.config.MA_TIME_STEP}s")
-        print()
+        reward = 0.0
+        components = {}
+
+        # Collision penalty
+        if collision:
+            reward += self.config.SA_REWARD_COLLISION
+            components["collision_penalty"] = self.config.SA_REWARD_COLLISION
+
+        # Goal bonus
+        if success:
+            reward += self.config.SA_REWARD_GOAL
+            components["goal_bonus"] = self.config.SA_REWARD_GOAL
+
+        # Path distance penalty (negative reward proportional to goal distance)
+        path_penalty = self.config.SA_REWARD_PATH_COEFF * dist_goal
+        reward += path_penalty
+        components["path_penalty"] = path_penalty
+
+        # Safety penalty (penalize getting close to obstacles)
+        # Count rays below safety threshold (normalized lidar values)
+        safety_threshold = self.config.SA_SAFETY_DISTANCE / self.config.LIDAR_CLIP_RANGE
+        unsafe_rays = np.sum(lidar_scan < safety_threshold)
+        safety_penalty = self.config.SA_REWARD_SAFETY_COEFF * (unsafe_rays / len(lidar_scan))
+        reward += safety_penalty
+        components["safety_penalty"] = safety_penalty
+
+        # Progress reward (bonus for getting closer to goal)
+        if self._prev_dist_goal is not None:
+            progress = self._prev_dist_goal - dist_goal
+            progress_reward = progress * 5.0  # Scale factor
+            reward += progress_reward
+            components["progress_reward"] = progress_reward
+        self._prev_dist_goal = dist_goal
+
+        components["total"] = reward
+        return reward, components
+
+    def compute_ma_reward(
+        self,
+        subgoal_x: float,
+        subgoal_y: float,
+        robot_x: float,
+        robot_y: float,
+        collision: bool,
+    ) -> Tuple[float, Dict[str, float]]:
+        """
+        Compute Motion Agent reward based on hierarchical formulation.
         
-        best_success_rate = 0
-        recent_successes = deque(maxlen=100)
-        
-        for episode in range(1, num_episodes + 1):
-            # Reset environment (random scene)
-            obs = self.env.reset()
-            
-            episode_reward = 0
-            sa_steps = 0
-            
-            done = False
-            while not done:
-                # SA predicts subgoal
-                lidar = obs['lidar']
-                waypoints = obs['waypoints']
-                
-                if self.sa.total_steps < self.config.SA_BATCH_SIZE * 5:
-                    # Random exploration
-                    sa_action = np.array([
-                        np.random.uniform(0, self.config.SUBGOAL_MAX_DISTANCE),
-                        np.random.uniform(0, 2 * np.pi)
-                    ])
-                    should_replan = False
-                else:
-                    sa_action, should_replan = self.sa.select_action(lidar, waypoints, add_noise=True)
-                
-                # Execute SA step (internally runs MA steps)
-                # For now, we'll manually run MA steps
-                l, theta = sa_action[0], sa_action[1]
-                subgoal_x = l * np.cos(theta)
-                subgoal_y = l * np.sin(theta)
-                self.env.current_subgoal = (subgoal_x, subgoal_y)
-                
-                # Run MA steps
-                ma_rewards = []
-                for _ in range(self.config.MA_STEPS_PER_SA):
-                    ma_state = self.env._get_ma_state()
-                    ma_action = self.ma.select_action(ma_state, add_noise=False)
-                    _, ma_reward, done, info = self.env.step_ma(ma_action)
-                    ma_rewards.append(ma_reward)
-                    
-                    if done:
-                        break
-                
-                # Get new observation
-                new_obs = self.env._get_observation()
-                
-                # Compute SA reward
-                termination = TerminationReason(info.get('termination', 'none'))
-                sa_reward = self.env._compute_sa_reward(done, termination)
-                
-                # Store transition
-                new_lidar = new_obs['lidar']
-                new_waypoints = new_obs['waypoints']
-                self.sa.store_transition(
-                    lidar, waypoints, sa_action, sa_reward,
-                    new_lidar, new_waypoints, done
-                )
-                
-                # Train SA
-                if self.sa.total_steps >= self.config.SA_BATCH_SIZE:
-                    self.sa.train_step()
-                
-                obs = new_obs
-                episode_reward += sa_reward
-                sa_steps += 1
-                self.sa.total_steps += 1
-            
-            # Track success
-            success = termination == TerminationReason.GOAL_REACHED
-            recent_successes.append(success)
-            
-            # Log
-            self.logger.log(
-                episode, episode_reward, sa_steps, success,
-                termination=termination.value
-            )
-            
-            # Print progress
-            if episode % 10 == 0:
-                print(f"Episode {episode}/{num_episodes}")
-                self.logger.print_summary()
-                
-                # Check for best model
-                if len(recent_successes) >= 100:
-                    current_rate = np.mean(list(recent_successes))
-                    if current_rate > best_success_rate:
-                        best_success_rate = current_rate
-                        self._save_model('best')
-                        print(f"  New best! Success rate: {best_success_rate*100:.1f}%")
-            
-            # Periodic save
-            if episode % 500 == 0:
-                self._save_model(f'ep{episode}')
-                self.logger.save()
-        
-        print(f"\nTraining complete. Best success rate: {best_success_rate*100:.1f}%")
-        self._save_model('final')
-        self.logger.save()
-    
-    def _save_model(self, suffix: str):
-        """Save SA model."""
-        path = os.path.join(self.model_dir, f'sa_{suffix}.pth')
-        self.sa.save(path)
-        print(f"Saved SA model to {path}")
+        MA Reward components:
+        - Subgoal reach bonus: MA_REWARD_REACH (2.0)
+        - Distance penalty: MA_REWARD_DIST_COEFF * distance_to_subgoal
+        """
+        reward = 0.0
+        components = {}
+
+        # Distance to subgoal in robot frame (subgoal is relative to robot)
+        dist_subgoal = math.hypot(subgoal_x, subgoal_y)
+
+        # Subgoal reached bonus
+        if dist_subgoal < self.config.MA_SUBGOAL_THRESHOLD:
+            reward += self.config.MA_REWARD_REACH
+            components["subgoal_reached"] = self.config.MA_REWARD_REACH
+
+        # Distance penalty
+        dist_penalty = self.config.MA_REWARD_DIST_COEFF * dist_subgoal
+        reward += dist_penalty
+        components["dist_penalty"] = dist_penalty
+
+        # Progress toward subgoal
+        if self._prev_dist_subgoal is not None:
+            progress = self._prev_dist_subgoal - dist_subgoal
+            progress_reward = progress * 2.0  # Scale factor
+            reward += progress_reward
+            components["subgoal_progress"] = progress_reward
+        self._prev_dist_subgoal = dist_subgoal
+
+        # Collision penalty for MA as well
+        if collision:
+            reward += self.config.SA_REWARD_COLLISION * 0.5  # Half penalty
+            components["collision_penalty"] = self.config.SA_REWARD_COLLISION * 0.5
+
+        components["total"] = reward
+        return reward, components
 
 
 class HierarchicalTrainer:
-    """
-    Complete hierarchical training pipeline.
-    
-    Manages both MA pre-training and SA training stages.
-    """
-    
+    """Simple on-robot trainer for hierarchical navigation."""
+
     def __init__(
         self,
-        config: HierarchicalConfig = None,
-        output_dir: str = None,
-        device: str = None
-    ):
-        if config is None:
-            config = HierarchicalConfig()
-        
+        config: HierarchicalConfig,
+        goal: Tuple[float, float] = (1.5, 0.0),
+        sa_checkpoint: str | None = None,
+        ma_checkpoint: str | None = None,
+        log_file: str | None = None,
+    ) -> None:
         self.config = config
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.env = HierarchicalEnv(config=config, goal=goal)
+        self.sa = SubgoalAgent(config=config)
+        self.ma = MotionAgent(config=config)
+        self.reward_computer = HierarchicalRewardComputer(config=config)
+
+        # Optional file logging for detailed run traces
+        self.logger = logging.getLogger("hierarchical_trainer")
+        self.logger.setLevel(logging.INFO)
+        if log_file:
+            log_path = Path(log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+            fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            self.logger.addHandler(fh)
+        # Mirror to stdout via ROS logger by default
+        self.logger.addHandler(logging.StreamHandler())
+
+        # Load pretrained checkpoints when provided
+        if sa_checkpoint and os.path.exists(sa_checkpoint):
+            self.sa.load(sa_checkpoint)
+            self.env.get_logger().info(f"Loaded SA checkpoint: {sa_checkpoint}")
+            self.logger.info(f"Loaded SA checkpoint: {sa_checkpoint}")
+        if ma_checkpoint and os.path.exists(ma_checkpoint):
+            self.ma.load(ma_checkpoint)
+            self.env.get_logger().info(f"Loaded MA checkpoint: {ma_checkpoint}")
+            self.logger.info(f"Loaded MA checkpoint: {ma_checkpoint}")
+
+    def train(self, episodes: int = 1) -> None:
+        for ep in range(1, episodes + 1):
+            obs = self.env.reset()
+            self.sa.reset_noise()
+            self.reward_computer.reset()
+            ep_sa_reward = 0.0
+            ep_ma_reward = 0.0
+
+            lidar = obs["lidar"]
+            wps = obs["waypoints"]
+
+            for step in range(self.config.EPISODE_TIMEOUT):
+                sa_action, _ = self.sa.select_action(lidar, wps, add_noise=True)
+                px, py = self.sa.subgoal_to_cartesian(sa_action[0], sa_action[1])
+
+                ma_state = self.ma.build_state(
+                    prev_v=self.env.last_cmd[0],
+                    prev_omega=self.env.last_cmd[1],
+                    subgoal_x=px,
+                    subgoal_y=py,
+                )
+                ma_action = self.ma.select_action(ma_state, add_noise=True)
+
+                step_result = self.env.step(ma_action)
+                next_obs = step_result["observation"]
+                done = step_result["done"]
+                info = step_result["info"]
+
+                # Compute hierarchical rewards
+                sa_reward, sa_components = self.reward_computer.compute_sa_reward(
+                    dist_goal=info["dist_goal"],
+                    min_lidar=info["min_lidar"],
+                    collision=info["collision"],
+                    success=info["success"],
+                    lidar_scan=next_obs["lidar"],
+                )
+                ma_reward, ma_components = self.reward_computer.compute_ma_reward(
+                    subgoal_x=px,
+                    subgoal_y=py,
+                    robot_x=0.0,  # Subgoal is in robot frame
+                    robot_y=0.0,
+                    collision=info["collision"],
+                )
+                ep_sa_reward += sa_reward
+                ep_ma_reward += ma_reward
+
+                next_lidar = next_obs["lidar"]
+                next_wps = next_obs["waypoints"]
+                next_ma_state = self.ma.build_state(
+                    prev_v=self.env.last_cmd[0],
+                    prev_omega=self.env.last_cmd[1],
+                    subgoal_x=px,
+                    subgoal_y=py,
+                )
+
+                # Store transitions with hierarchical rewards
+                self.sa.store_transition(lidar, wps, sa_action, sa_reward, next_lidar, next_wps, done)
+                self.ma.store_transition(ma_state, ma_action, ma_reward, next_ma_state, done)
+
+                # Updates
+                self.sa.update()
+                self.ma.update()
+
+                # Prepare next step
+                lidar, wps = next_lidar, next_wps
+                self.logger.info(
+                    "EP %d step %d | sa_r=%.3f ma_r=%.3f dist_goal=%.3f min_lidar=%.3f collision=%s success=%s",
+                    ep,
+                    step,
+                    sa_reward,
+                    ma_reward,
+                    info.get("dist_goal", float("nan")),
+                    info.get("min_lidar", float("nan")),
+                    info.get("collision"),
+                    info.get("success"),
+                )
+                if done:
+                    break
+
+            self.env.get_logger().info(f"Episode {ep}/{episodes} | SA_Reward={ep_sa_reward:.2f} MA_Reward={ep_ma_reward:.2f}")
+            self.logger.info("Episode %d/%d total_sa_reward=%.3f total_ma_reward=%.3f", ep, episodes, ep_sa_reward, ep_ma_reward)
+
+    def run(self, episodes: int = 1, render: bool = False) -> None:
+        """Run inference with hierarchical reward computation."""
+        self.sa.set_training(False)
+        self.ma.set_training(False)
         
-        # Set up directories
-        if output_dir is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            # Get the turtlebot3_drl package directory
-            _current_file = os.path.abspath(__file__)
-            _training_dir = os.path.dirname(_current_file)
-            _hierarchical_dir = os.path.dirname(_training_dir)
-            _turtlebot3_drl_dir = os.path.dirname(_hierarchical_dir)
+        all_results = []
+        
+        for ep in range(1, episodes + 1):
+            obs = self.env.reset()
+            self.reward_computer.reset()
+            lidar = obs["lidar"]
+            wps = obs["waypoints"]
             
-            output_dir = os.path.join(
-                _turtlebot3_drl_dir,
-                'model',
-                'hierarchical',
-                f'session_{timestamp}'
+            ep_sa_reward = 0.0
+            ep_ma_reward = 0.0
+            step_count = 0
+            outcome = "TIMEOUT"
+
+            for step in range(self.config.EPISODE_TIMEOUT):
+                step_count = step + 1
+                sa_action, _ = self.sa.select_action(lidar, wps, add_noise=False)
+                px, py = self.sa.subgoal_to_cartesian(sa_action[0], sa_action[1])
+                ma_state = self.ma.build_state(
+                    prev_v=self.env.last_cmd[0],
+                    prev_omega=self.env.last_cmd[1],
+                    subgoal_x=px,
+                    subgoal_y=py,
+                )
+                ma_action = self.ma.select_action(ma_state, add_noise=False)
+                step_result = self.env.step(ma_action)
+                obs = step_result["observation"]
+                info = step_result["info"]
+                lidar = obs["lidar"]
+                wps = obs["waypoints"]
+                
+                # Compute hierarchical rewards
+                sa_reward, sa_components = self.reward_computer.compute_sa_reward(
+                    dist_goal=info["dist_goal"],
+                    min_lidar=info["min_lidar"],
+                    collision=info["collision"],
+                    success=info["success"],
+                    lidar_scan=obs["lidar"],
+                )
+                ma_reward, ma_components = self.reward_computer.compute_ma_reward(
+                    subgoal_x=px,
+                    subgoal_y=py,
+                    robot_x=0.0,
+                    robot_y=0.0,
+                    collision=info["collision"],
+                )
+                ep_sa_reward += sa_reward
+                ep_ma_reward += ma_reward
+                
+                # Log every 50 steps for detailed progress
+                if step % 50 == 0 or step_result["done"]:
+                    self.logger.info(
+                        "[RUN] EP %d step %d | sa_r=%.2f ma_r=%.2f dist_goal=%.3f min_lidar=%.3f collision=%s success=%s",
+                        ep,
+                        step,
+                        sa_reward,
+                        ma_reward,
+                        info.get("dist_goal", float("nan")),
+                        info.get("min_lidar", float("nan")),
+                        info.get("collision"),
+                        info.get("success"),
+                    )
+                
+                if step_result["done"]:
+                    if info["success"]:
+                        outcome = "SUCCESS"
+                    elif info["collision"]:
+                        outcome = "COLLISION"
+                    break
+            
+            # Episode summary
+            ep_result = {
+                "episode": ep,
+                "outcome": outcome,
+                "steps": step_count,
+                "sa_reward": ep_sa_reward,
+                "ma_reward": ep_ma_reward,
+                "total_reward": ep_sa_reward + ep_ma_reward,
+            }
+            all_results.append(ep_result)
+            
+            self.env.get_logger().info(
+                f"[RUN] Episode {ep}/{episodes} | Outcome={outcome} Steps={step_count} "
+                f"SA_R={ep_sa_reward:.2f} MA_R={ep_ma_reward:.2f} Total={ep_sa_reward + ep_ma_reward:.2f}"
+            )
+            self.logger.info(
+                "[RUN] Episode %d/%d outcome=%s steps=%d sa_reward=%.3f ma_reward=%.3f total=%.3f",
+                ep, episodes, outcome, step_count, ep_sa_reward, ep_ma_reward, ep_sa_reward + ep_ma_reward
             )
         
-        self.output_dir = output_dir
-        self.ma_dir = os.path.join(output_dir, 'ma')
-        self.sa_dir = os.path.join(output_dir, 'sa')
+        # Final summary
+        self.logger.info("=" * 60)
+        self.logger.info("FINAL SUMMARY:")
+        self.logger.info("=" * 60)
         
-        os.makedirs(self.ma_dir, exist_ok=True)
-        os.makedirs(self.sa_dir, exist_ok=True)
+        successes = sum(1 for r in all_results if r["outcome"] == "SUCCESS")
+        collisions = sum(1 for r in all_results if r["outcome"] == "COLLISION")
+        timeouts = sum(1 for r in all_results if r["outcome"] == "TIMEOUT")
+        avg_sa = np.mean([r["sa_reward"] for r in all_results])
+        avg_ma = np.mean([r["ma_reward"] for r in all_results])
+        avg_total = np.mean([r["total_reward"] for r in all_results])
+        avg_steps = np.mean([r["steps"] for r in all_results])
         
-        # Save config
-        config_path = os.path.join(output_dir, 'config.json')
-        with open(config_path, 'w') as f:
-            json.dump(self._config_to_dict(), f, indent=2)
-    
-    def _config_to_dict(self) -> Dict:
-        """Convert config to dictionary for saving."""
-        return {
-            key: getattr(self.config, key)
-            for key in dir(self.config)
-            if not key.startswith('_') and not callable(getattr(self.config, key))
-        }
-    
-    def train_ma(self, max_episodes: int = 10000) -> bool:
-        """
-        Stage 1: Pre-train Motion Agent.
+        for r in all_results:
+            self.logger.info(
+                "  Episode %d: %s, steps=%d, SA_R=%.2f, MA_R=%.2f, Total=%.2f",
+                r["episode"], r["outcome"], r["steps"], r["sa_reward"], r["ma_reward"], r["total_reward"]
+            )
         
-        Returns:
-            True if converged
-        """
-        trainer = MAPretrainer(self.config, self.ma_dir, self.device)
-        return trainer.train(max_episodes)
-    
-    def train_sa(
-        self,
-        num_episodes: int = 5000,
-        ma_model: str = 'converged'
-    ):
-        """
-        Stage 2: Train Subgoal Agent.
+        self.logger.info("-" * 60)
+        self.logger.info("STATISTICS:")
+        self.logger.info("  Success Rate: %d/%d (%.1f%%)", successes, episodes, 100 * successes / episodes)
+        self.logger.info("  Collisions: %d, Timeouts: %d", collisions, timeouts)
+        self.logger.info("  Avg Steps: %.1f", avg_steps)
+        self.logger.info("  Avg SA Reward: %.2f", avg_sa)
+        self.logger.info("  Avg MA Reward: %.2f", avg_ma)
+        self.logger.info("  Avg Total Reward: %.2f", avg_total)
+        self.logger.info("=" * 60)
         
-        Args:
-            num_episodes: Training episodes
-            ma_model: Which MA model to use ('converged', 'final', or path)
-        """
-        # Find MA model
-        if os.path.isfile(ma_model):
-            ma_path = ma_model
-        else:
-            ma_path = os.path.join(self.ma_dir, f'ma_{ma_model}.pth')
-        
-        if not os.path.exists(ma_path):
-            raise FileNotFoundError(f"MA model not found: {ma_path}")
-        
-        trainer = SATrainer(self.config, self.sa_dir, ma_path, self.device)
-        trainer.train(num_episodes)
-    
-    def train_full(
-        self,
-        ma_max_episodes: int = 10000,
-        sa_episodes: int = 5000
-    ):
-        """
-        Full two-stage training.
-        
-        Args:
-            ma_max_episodes: Max episodes for MA pre-training
-            sa_episodes: Episodes for SA training
-        """
-        print("\n" + "="*60)
-        print("HIERARCHICAL DRL TRAINING PIPELINE")
-        print("="*60)
-        print(f"Output directory: {self.output_dir}")
-        print(f"Device: {self.device}")
-        print()
-        
-        # Stage 1
-        ma_converged = self.train_ma(ma_max_episodes)
-        
-        if not ma_converged:
-            print("\nWARNING: MA did not converge. Continuing with best model...")
-        
-        # Stage 2
-        self.train_sa(sa_episodes)
-        
-        print("\n" + "="*60)
-        print("TRAINING COMPLETE")
-        print("="*60)
-        print(f"Models saved to: {self.output_dir}")
+        self.env.get_logger().info(
+            f"FINAL: Success={successes}/{episodes} ({100*successes/episodes:.1f}%) "
+            f"AvgSA={avg_sa:.2f} AvgMA={avg_ma:.2f} AvgTotal={avg_total:.2f}"
+        )
+
+    def shutdown(self) -> None:
+        self.env.shutdown()
 
 
-def main():
-    """Main entry point for training."""
-    parser = argparse.ArgumentParser(
-        description='Hierarchical DRL Navigation Training',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Full training (both stages)
-  python hierarchical_trainer.py --stage full
+# ---------------------------------------------------------------------------
+# Entrypoints
+# ---------------------------------------------------------------------------
 
-  # Pre-train Motion Agent only
-  python hierarchical_trainer.py --stage 1
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Hierarchical DRL trainer")
+    parser.add_argument("--episodes", type=int, default=1, help="Number of episodes")
+    parser.add_argument("--goal", type=float, nargs=2, default=[1.5, 0.0], metavar=("X", "Y"))
+    parser.add_argument("--mode", type=str, choices=["train", "run"], default="train")
+    parser.add_argument("--sa-checkpoint", type=str, default=None, help="Path to SA checkpoint (.pth)")
+    parser.add_argument("--ma-checkpoint", type=str, default=None, help="Path to MA checkpoint (.pth)")
+    parser.add_argument("--log-file", type=str, default=None, help="Optional log file to store detailed run logs")
+    return parser.parse_args()
 
-  # Train Subgoal Agent (requires pre-trained MA)
-  python hierarchical_trainer.py --stage 2 --ma-model path/to/ma.pth
 
-  # Continue from existing session
-  python hierarchical_trainer.py --stage 2 --output-dir path/to/session
-        """
-    )
-    
-    parser.add_argument(
-        '--stage',
-        type=str,
-        choices=['1', '2', 'full', 'ma', 'sa'],
-        default='full',
-        help='Training stage: 1/ma (MA pre-training), 2/sa (SA training), full (both)'
-    )
-    
-    parser.add_argument(
-        '--output-dir',
-        type=str,
-        default=None,
-        help='Output directory for models and logs'
-    )
-    
-    parser.add_argument(
-        '--ma-model',
-        type=str,
-        default='converged',
-        help='MA model to use for SA training (path or "converged"/"final")'
-    )
-    
-    parser.add_argument(
-        '--ma-episodes',
-        type=int,
-        default=10000,
-        help='Max episodes for MA pre-training'
-    )
-    
-    parser.add_argument(
-        '--sa-episodes',
-        type=int,
-        default=5000,
-        help='Episodes for SA training'
-    )
-    
-    parser.add_argument(
-        '--device',
-        type=str,
-        default=None,
-        help='Device (cuda/cpu)'
-    )
-    
-    args = parser.parse_args()
-    
-    # Create trainer
+def main_train() -> None:
+    args = _parse_args()
+    config = HierarchicalConfig()
+    rclpy.init()
     trainer = HierarchicalTrainer(
-        output_dir=args.output_dir,
-        device=args.device
+        config=config,
+        goal=(args.goal[0], args.goal[1]),
+        sa_checkpoint=args.sa_checkpoint,
+        ma_checkpoint=args.ma_checkpoint,
+        log_file=args.log_file,
     )
-    
-    # Run appropriate stage
-    if args.stage in ['full']:
-        trainer.train_full(args.ma_episodes, args.sa_episodes)
-    elif args.stage in ['1', 'ma']:
-        trainer.train_ma(args.ma_episodes)
-    elif args.stage in ['2', 'sa']:
-        trainer.train_sa(args.sa_episodes, args.ma_model)
+    try:
+        trainer.train(episodes=args.episodes)
+    finally:
+        trainer.shutdown()
+        rclpy.shutdown()
 
 
-if __name__ == '__main__':
-    main()
+def main_run() -> None:
+    args = _parse_args()
+    config = HierarchicalConfig()
+    rclpy.init()
+    trainer = HierarchicalTrainer(
+        config=config,
+        goal=(args.goal[0], args.goal[1]),
+        sa_checkpoint=args.sa_checkpoint,
+        ma_checkpoint=args.ma_checkpoint,
+        log_file=args.log_file,
+    )
+    try:
+        if args.mode == "train":
+            trainer.train(episodes=args.episodes)
+        else:
+            trainer.run(episodes=args.episodes)
+    finally:
+        trainer.shutdown()
+        rclpy.shutdown()
