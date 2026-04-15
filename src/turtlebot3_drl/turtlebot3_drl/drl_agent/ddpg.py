@@ -12,6 +12,8 @@ from ..drl_environment.drl_environment import NUM_SCAN_SAMPLES
 
 from .off_policy_agent import OffPolicyAgent, Network
 
+
+# this is RL project
 LINEAR = 0
 ANGULAR = 1
 
